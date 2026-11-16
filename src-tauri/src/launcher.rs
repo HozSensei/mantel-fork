@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -55,69 +55,35 @@ struct Target {
     window: bool,
 }
 
-#[derive(Clone)]
-struct ProcessBinding {
+static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+
+/// The processes each running game was last seen with, so closing or switching to one game
+/// doesn't reach another that runs the same program, as games added from one emulator do.
+static PIDS: LazyLock<Mutex<HashMap<String, HashSet<u32>>>> = LazyLock::new(Default::default);
+
+/// A process a launch from Mantel claimed, and who it belongs to for as long as it runs.
+struct Claim {
     name: String,
-    exe: Option<String>,
     owners: Vec<String>,
 }
 
-impl ProcessBinding {
-    fn new(process: &sysinfo::Process, owners: Vec<String>) -> Self {
-        Self {
-            name: process.name().to_string_lossy().to_lowercase(),
-            exe: process.exe().map(|p| normalize_path(&p.to_string_lossy())),
-            owners,
-        }
-    }
-
-    fn matches(&self, process: &sysinfo::Process) -> bool {
-        self.name == process.name().to_string_lossy().to_lowercase()
-            && match (&self.exe, process.exe()) {
-                (Some(known), Some(current)) => {
-                    known == &normalize_path(&current.to_string_lossy())
-                }
-                _ => true,
-            }
-    }
-}
-
-static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
-static PROCESS_IDS: OnceLock<Mutex<HashMap<String, HashSet<u32>>>> = OnceLock::new();
-
-fn process_ids() -> &'static Mutex<HashMap<String, HashSet<u32>>> {
-    PROCESS_IDS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// The selected launch owns its process; a matching app may also represent that same process.
-/// Without launch intent, preserve the existing first-match behavior so an emulator doesn't
-/// make every shortcut using it look active.
-fn process_owners(
-    targets: &[Target],
-    matched: &[&Target],
-    pending_id: Option<&str>,
-    pending_pid: bool,
-) -> Vec<String> {
-    let primary = if pending_pid {
-        pending_id.and_then(|id| targets.iter().find(|t| t.id == id))
-    } else {
-        pending_id.and_then(|id| matched.iter().copied().find(|t| t.id == id))
-    }
-    .or_else(|| matched.first().copied());
-    let Some(primary) = primary else {
-        return Vec::new();
-    };
-    let mut owners = vec![primary.id.clone()];
-    if !primary.window {
-        if let Some(app) = matched
-            .iter()
-            .copied()
-            .find(|t| t.window && t.id != primary.id)
-        {
-            owners.push(app.id.clone());
-        }
+/// Who a process belongs to. A launch claims the process it started, so of several shortcuts
+/// that run one emulator only the one launched counts as running, along with an app that runs
+/// the same program, like that emulator on the Apps tab. Any other process goes to the first
+/// game or app it matches.
+fn owners_of(matched: &[&Target], claimed: Option<&str>) -> Vec<String> {
+    let Some(first) = claimed.or_else(|| matched.first().map(|t| t.id.as_str())) else { return Vec::new() };
+    let mut owners = vec![first.to_string()];
+    if !matched.iter().any(|t| t.id == first && t.window) {
+        owners.extend(matched.iter().find(|t| t.window && t.id != first).map(|t| t.id.clone()));
     }
     owners
+}
+
+/// The processes the tracker last saw for a game, or the one Mantel just started for it.
+fn known_pids(id: &str) -> Option<HashSet<u32>> {
+    let seen = PIDS.lock().unwrap().get(id).cloned();
+    seen.or_else(|| PENDING.lock().unwrap().as_ref().filter(|p| p.id == id).and_then(|p| p.pid).map(|pid| HashSet::from([pid])))
 }
 
 /// Launchers like Steam may update or show a login before the game appears.
@@ -137,24 +103,26 @@ pub fn launch(app: &AppHandle, game: &Game) -> Result<(), String> {
         };
     }
     let pid = match &game.launch {
-        Launch::Uri { uri } => {
-            open_uri(uri)?;
-            None
-        }
+        // A shortcut to a program runs that program, as the shortcut would. Through the shell,
+        // Windows first asks whether to run a program downloaded from the internet, like an
+        // emulator from its site, and from Mantel that question fails with code 5 (#34).
+        Launch::Uri { uri } => match shortcut_command(uri) {
+            Some(mut cmd) => {
+                crate::log::info(&format!("launch {}: its shortcut runs {}", game.id, cmd.get_program().to_string_lossy()));
+                Some(cmd.spawn().map_err(|e| format!("Couldn't start {uri}: {e}"))?.id())
+            }
+            None => {
+                open_uri(uri)?;
+                None
+            }
+        },
         Launch::Exe { path, args, cwd } => {
             let mut cmd = std::process::Command::new(path);
             cmd.args(args);
-            if let Some(dir) = cwd
-                .as_deref()
-                .or_else(|| Path::new(path).parent().and_then(Path::to_str))
-            {
+            if let Some(dir) = cwd.as_deref().or_else(|| Path::new(path).parent().and_then(Path::to_str)) {
                 cmd.current_dir(dir);
             }
-            Some(
-                cmd.spawn()
-                    .map_err(|e| format!("Couldn't start {path}: {e}"))?
-                    .id(),
-            )
+            Some(cmd.spawn().map_err(|e| format!("Couldn't start {path}: {e}"))?.id())
         }
     };
     crate::log::info(&format!("launch {} via {:?}", game.id, game.launch));
@@ -163,17 +131,8 @@ pub fn launch(app: &AppHandle, game: &Game) -> Result<(), String> {
     // goes away: nothing of the site's own to follow.
     let pid = if game.site.is_some() { None } else { pid };
     let trackable = pid.is_some() || game.install_dir.is_some() || !game.exe_names.is_empty();
-    *PENDING.lock().unwrap() = Some(Pending {
-        id: game.id.clone(),
-        at: Instant::now(),
-        pid,
-        trackable,
-    });
-    launched(
-        &mut app.state::<AppState>().running.lock().unwrap(),
-        &game.id,
-        now(),
-    );
+    *PENDING.lock().unwrap() = Some(Pending { id: game.id.clone(), at: Instant::now(), pid, trackable });
+    launched(&mut app.state::<AppState>().running.lock().unwrap(), &game.id, now());
     Ok(())
 }
 
@@ -182,11 +141,7 @@ pub fn launch(app: &AppHandle, game: &Game) -> Result<(), String> {
 fn launched(running: &mut Vec<Running>, id: &str, at: i64) {
     running.retain(|r| r.detected);
     if !running.iter().any(|r| r.id == id) {
-        running.push(Running {
-            id: id.to_string(),
-            started_at: at,
-            detected: false,
-        });
+        running.push(Running { id: id.to_string(), started_at: at, detected: false });
     }
 }
 
@@ -194,11 +149,7 @@ fn launched(running: &mut Vec<Running>, id: &str, at: i64) {
 fn detected(running: &mut Vec<Running>, id: &str, at: i64) {
     match running.iter_mut().find(|r| r.id == id) {
         Some(r) => r.detected = true,
-        None => running.push(Running {
-            id: id.to_string(),
-            started_at: at,
-            detected: true,
-        }),
+        None => running.push(Running { id: id.to_string(), started_at: at, detected: true }),
     }
 }
 
@@ -220,51 +171,20 @@ static CLOSED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// can outlive it; that's when this returns an error.
 pub fn close(app: &AppHandle, id: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let Some(running) = state
-        .running
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|r| r.id == id)
-        .cloned()
-    else {
-        return Ok(());
-    };
+    let Some(running) = state.running.lock().unwrap().iter().find(|r| r.id == id).cloned() else { return Ok(()) };
     let targets = targets(app);
     let target = targets.iter().find(|t| t.id == running.id);
-    let known_pids = if target.is_some_and(|t| !t.window) {
-        process_ids().lock().unwrap().get(id).cloned().or_else(|| {
-            PENDING
-                .lock()
-                .unwrap()
-                .as_ref()
-                .filter(|p| p.id == id)
-                .and_then(|p| p.pid)
-                .map(|pid| HashSet::from([pid]))
-        })
-    } else {
-        None
-    };
-    let name = state
-        .cache
-        .lock()
-        .unwrap()
-        .library
-        .iter()
-        .find(|g| g.id == running.id)
-        .map(|g| g.name.clone())
-        .unwrap_or_default();
+    let name = state.cache.lock().unwrap().library.iter().find(|g| g.id == running.id).map(|g| g.name.clone()).unwrap_or_default();
+    // A game's own processes when the tracker knows them; an app is all of its program.
+    let known = if target.is_some_and(|t| t.window) { None } else { known_pids(id) };
     let mut sys = System::new();
     let alive = |sys: &mut System| {
-        let mut pids = if let Some(known) = &known_pids {
-            refresh(sys);
-            known
-                .iter()
-                .copied()
-                .filter(|pid| sys.process(sysinfo::Pid::from_u32(*pid)).is_some())
-                .collect()
-        } else {
-            target.map(|t| processes_of(sys, t)).unwrap_or_default()
+        let mut pids = match &known {
+            Some(known) => {
+                refresh(sys);
+                known.iter().copied().filter(|&pid| sys.process(sysinfo::Pid::from_u32(pid)).is_some()).collect()
+            }
+            None => target.map(|t| processes_of(sys, t)).unwrap_or_default(),
         };
         pids.extend(splash_of(sys, &name));
         pids
@@ -278,7 +198,6 @@ pub fn close(app: &AppHandle, id: &str) -> Result<(), String> {
                 *pending = None;
             }
             state.running.lock().unwrap().retain(|r| r.id != id);
-            process_ids().lock().unwrap().remove(id);
         }
         return Ok(());
     }
@@ -304,10 +223,7 @@ pub fn close(app: &AppHandle, id: &str) -> Result<(), String> {
     if !left.is_empty() {
         for &pid in &left {
             if let Err(e) = terminate(&sys, pid) {
-                crate::log::warn(&format!(
-                    "close {}: couldn't end process {pid}: {e}",
-                    running.id
-                ));
+                crate::log::warn(&format!("close {}: couldn't end process {pid}: {e}", running.id));
             }
         }
         let deadline = Instant::now() + KILL_WAIT;
@@ -320,19 +236,9 @@ pub fn close(app: &AppHandle, id: &str) -> Result<(), String> {
         }
     }
     if !left.is_empty() {
-        crate::log::warn(&format!(
-            "close {}: {} processes refused to quit",
-            running.id,
-            left.len()
-        ));
-        let name = if name.is_empty() {
-            "the game"
-        } else {
-            name.as_str()
-        };
-        return Err(format!(
-            "Windows didn't let Mantel close {name}. Quit it from the game's own menu."
-        ));
+        crate::log::warn(&format!("close {}: {} processes refused to quit", running.id, left.len()));
+        let name = if name.is_empty() { "the game" } else { name.as_str() };
+        return Err(format!("Windows didn't let Mantel close {name}. Quit it from the game's own menu."));
     }
     CLOSED.lock().unwrap().push(running.id);
     Ok(())
@@ -341,34 +247,16 @@ pub fn close(app: &AppHandle, id: &str) -> Result<(), String> {
 /// Brings a running game's window to the front. False when it has no window at all,
 /// which happens when a game hangs or keeps running in the background after "closing".
 pub fn switch_to(app: &AppHandle, id: &str) -> bool {
-    let running = app
-        .state::<AppState>()
-        .running
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|r| r.id == id)
-        .cloned();
-    let Some(running) = running else { return false };
-    let known_pids = process_ids().lock().unwrap().get(id).cloned().or_else(|| {
-        PENDING
-            .lock()
-            .unwrap()
-            .as_ref()
-            .filter(|p| p.id == id)
-            .and_then(|p| p.pid)
-            .map(|pid| HashSet::from([pid]))
-    });
-    if let Some(pids) = known_pids {
+    let Some(running) = app.state::<AppState>().running.lock().unwrap().iter().find(|r| r.id == id).cloned() else { return false };
+    if let Some(pids) = known_pids(id) {
         return focus_window_of(&pids.into_iter().collect::<Vec<_>>());
     }
+    // Still starting through the shell: what matches it may be another game's.
     if !running.detected {
         return false;
     }
     let targets = targets(app);
-    let Some(target) = targets.iter().find(|t| t.id == id) else {
-        return false;
-    };
+    let Some(target) = targets.iter().find(|t| t.id == id) else { return false };
     focus_window_of(&processes_of(&mut System::new(), target))
 }
 
@@ -384,16 +272,10 @@ fn splash_of(sys: &mut System, name: &str) -> Vec<u32> {
     refresh(sys);
     sys.processes()
         .iter()
-        .filter(|(_, p)| {
-            p.name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("gamingservicesui.exe")
-        })
+        .filter(|(_, p)| p.name().to_string_lossy().eq_ignore_ascii_case("gamingservicesui.exe"))
         .map(|(pid, _)| pid.as_u32())
         .filter(|&pid| {
-            main_windows(&[pid])
-                .into_iter()
-                .any(|hwnd| window_title(hwnd).to_lowercase().starts_with(&name))
+            main_windows(&[pid]).into_iter().any(|hwnd| window_title(hwnd).to_lowercase().starts_with(&name))
         })
         .collect()
 }
@@ -403,9 +285,7 @@ fn window_title(hwnd: windows_sys::Win32::Foundation::HWND) -> String {
     use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW;
     let mut buf = [0u16; 256];
     let len = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
-    String::from_utf16_lossy(&buf[..len.max(0) as usize])
-        .trim()
-        .to_string()
+    String::from_utf16_lossy(&buf[..len.max(0) as usize]).trim().to_string()
 }
 
 /// Steam's windows besides its main one, like the dialog a steam:// link opens.
@@ -416,21 +296,10 @@ pub fn steam_dialogs(sys: &mut System) -> Vec<isize> {
     let pids: Vec<u32> = sys
         .processes()
         .iter()
-        .filter(|(_, p)| {
-            p.name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("steamwebhelper.exe")
-        })
+        .filter(|(_, p)| p.name().to_string_lossy().eq_ignore_ascii_case("steamwebhelper.exe"))
         .map(|(pid, _)| pid.as_u32())
         .collect();
-    main_windows(&pids)
-        .into_iter()
-        .filter(|w| {
-            let title = window_title(*w);
-            !title.is_empty() && title != "Steam"
-        })
-        .map(|w| w as isize)
-        .collect()
+    main_windows(&pids).into_iter().filter(|w| { let title = window_title(*w); !title.is_empty() && title != "Steam" }).map(|w| w as isize).collect()
 }
 
 #[cfg(not(windows))]
@@ -457,9 +326,7 @@ fn processes_of(sys: &mut System, target: &Target) -> Vec<u32> {
 #[cfg(windows)]
 fn main_windows(pids: &[u32]) -> Vec<windows_sys::Win32::Foundation::HWND> {
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindow, GetWindowThreadProcessId, IsWindowVisible, GW_OWNER,
-    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindow, GetWindowThreadProcessId, IsWindowVisible, GW_OWNER};
 
     struct Search<'a> {
         pids: &'a [u32],
@@ -469,31 +336,21 @@ fn main_windows(pids: &[u32]) -> Vec<windows_sys::Win32::Foundation::HWND> {
         let search = &mut *(lparam as *mut Search);
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, &mut pid);
-        if search.pids.contains(&pid)
-            && IsWindowVisible(hwnd) != 0
-            && GetWindow(hwnd, GW_OWNER).is_null()
-        {
+        if search.pids.contains(&pid) && IsWindowVisible(hwnd) != 0 && GetWindow(hwnd, GW_OWNER).is_null() {
             search.found.push(hwnd);
         }
         1
     }
 
-    let mut search = Search {
-        pids,
-        found: Vec::new(),
-    };
+    let mut search = Search { pids, found: Vec::new() };
     unsafe { EnumWindows(Some(visit), &mut search as *mut Search as LPARAM) };
     search.found
 }
 
 #[cfg(windows)]
 fn focus_window_of(pids: &[u32]) -> bool {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
-    };
-    let Some(&hwnd) = main_windows(pids).first() else {
-        return false;
-    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
+    let Some(&hwnd) = main_windows(pids).first() else { return false };
     unsafe {
         if IsIconic(hwnd) != 0 {
             ShowWindow(hwnd, SW_RESTORE);
@@ -511,10 +368,7 @@ fn ask_to_close(pids: &[u32]) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
     for hwnd in main_windows(pids) {
         if unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) } == 0 {
-            crate::log::info(&format!(
-                "close: a window didn't take the request (error {})",
-                unsafe { GetLastError() }
-            ));
+            crate::log::info(&format!("close: a window didn't take the request (error {})", unsafe { GetLastError() }));
         }
     }
 }
@@ -575,96 +429,61 @@ pub fn spawn_tracker(app: AppHandle) {
     std::thread::spawn(move || {
         let mut sys = System::new();
         let mut sessions: HashMap<String, Session> = HashMap::new();
-        let mut process_bindings: HashMap<u32, ProcessBinding> = HashMap::new();
+        let mut claims: HashMap<u32, Claim> = HashMap::new();
         loop {
             std::thread::sleep(POLL);
             let targets = targets(&app);
             refresh(&mut sys);
             check_front(&app);
 
-            let pending = PENDING
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|p| (p.id.clone(), p.pid));
+            let pending = PENDING.lock().unwrap().as_ref().map(|p| (p.id.clone(), p.pid));
             let mut alive: HashSet<String> = HashSet::new();
             let mut app_pids: HashMap<String, Vec<u32>> = HashMap::new();
-            let mut pids_by_id: HashMap<String, HashSet<u32>> = HashMap::new();
-            let mut seen_pids = HashSet::new();
-            for (pid, process) in sys.processes() {
+            let mut pids: HashMap<String, HashSet<u32>> = HashMap::new();
+            for (pid, p) in sys.processes() {
                 let pid = pid.as_u32();
                 if pid == std::process::id() {
                     continue;
                 }
-                seen_pids.insert(pid);
-                let binding = process_bindings
-                    .get(&pid)
-                    .filter(|b| b.matches(process))
-                    .cloned();
-                let owners = if let Some(binding) = binding {
-                    binding
-                        .owners
-                        .into_iter()
-                        .filter(|id| targets.iter().any(|target| target.id == *id))
-                        .collect()
-                } else {
-                    process_bindings.remove(&pid);
-                    let matched: Vec<&Target> =
-                        targets.iter().filter(|t| matches(t, process)).collect();
-                    let pending_match = pending.as_ref().and_then(|(id, expected_pid)| {
-                        let exact_pid = *expected_pid == Some(pid);
-                        let shell_match =
-                            expected_pid.is_none() && matched.iter().any(|t| t.id == *id);
-                        (exact_pid || shell_match).then_some((id.as_str(), exact_pid))
-                    });
-                    let owners = process_owners(
-                        &targets,
-                        &matched,
-                        pending_match.map(|(id, _)| id),
-                        pending_match.is_some_and(|(_, exact_pid)| exact_pid),
-                    );
-                    if pending_match.is_some() && !owners.is_empty() {
-                        process_bindings.insert(pid, ProcessBinding::new(process, owners.clone()));
+                let name = p.name().to_string_lossy().to_lowercase();
+                let owners = match claims.get(&pid).filter(|c| c.name == name) {
+                    Some(claim) => claim.owners.clone(),
+                    None => {
+                        claims.remove(&pid);
+                        let matched: Vec<&Target> = targets.iter().filter(|t| matches(t, p)).collect();
+                        // The launch Mantel waits for claims the process it started or, launched
+                        // through the shell, the processes that match it.
+                        let claimed = pending.as_ref().filter(|(id, started)| *started == Some(pid) || (started.is_none() && matched.iter().any(|t| &t.id == id))).map(|(id, _)| id.as_str());
+                        let owners = owners_of(&matched, claimed);
+                        if claimed.is_some() {
+                            claims.insert(pid, Claim { name, owners: owners.clone() });
+                        }
+                        owners
                     }
-                    owners
                 };
                 for id in owners {
-                    if targets
-                        .iter()
-                        .find(|t| t.id == id)
-                        .is_some_and(|t| t.window)
-                    {
+                    if targets.iter().any(|t| t.id == id && t.window) {
                         app_pids.entry(id.clone()).or_default().push(pid);
                     } else {
                         alive.insert(id.clone());
                     }
-                    pids_by_id.entry(id).or_default().insert(pid);
+                    pids.entry(id).or_default().insert(pid);
                 }
             }
-            process_bindings.retain(|pid, _| seen_pids.contains(pid));
-            alive.extend(
-                app_pids
-                    .into_iter()
-                    .filter(|(_, pids)| has_window(pids))
-                    .map(|(id, _)| id),
-            );
+            claims.retain(|pid, _| sys.process(sysinfo::Pid::from_u32(*pid)).is_some());
+            alive.extend(app_pids.into_iter().filter(|(_, pids)| has_window(pids)).map(|(id, _)| id));
+            // A session whose processes are gone has none, rather than whatever else runs its program.
             for id in sessions.keys() {
-                pids_by_id.entry(id.clone()).or_default();
+                pids.entry(id.clone()).or_default();
             }
-            *process_ids().lock().unwrap() = pids_by_id;
+            *PIDS.lock().unwrap() = pids;
+
             for id in &alive {
                 match sessions.get_mut(id) {
                     Some(s) => s.misses = 0,
                     None => {
                         let from_mantel = started(&app, id);
-                        sessions.insert(
-                            id.clone(),
-                            Session {
-                                since: Instant::now(),
-                                misses: 0,
-                                from_mantel,
-                            },
-                        );
+                        sessions.insert(id.clone(), Session { since: Instant::now(), misses: 0, from_mantel });
                     }
                 }
             }
@@ -687,13 +506,7 @@ pub fn spawn_tracker(app: AppHandle) {
 }
 
 fn is_app(app: &AppHandle, id: &str) -> bool {
-    app.state::<AppState>()
-        .cache
-        .lock()
-        .unwrap()
-        .library
-        .iter()
-        .any(|g| g.id == id && g.is_app())
+    app.state::<AppState>().cache.lock().unwrap().library.iter().any(|g| g.id == id && g.is_app())
 }
 
 /// A game's process just appeared. Returns whether Mantel launched it.
@@ -709,11 +522,7 @@ fn started(app: &AppHandle, id: &str) -> bool {
     };
     detected(&mut state.running.lock().unwrap(), id, now());
     // Apps have lines of their own, so a "session start" without an end always means a game.
-    let what = if is_app(app, id) {
-        "app open"
-    } else {
-        "session start"
-    };
+    let what = if is_app(app, id) { "app open" } else { "session start" };
     crate::log::info(&format!("{what} {id} (from mantel: {from_mantel})"));
     let _ = app.emit("game-started", id);
     if from_mantel && state.user.lock().unwrap().settings.minimize_on_launch {
@@ -727,11 +536,7 @@ fn started(app: &AppHandle, id: &str) -> bool {
 fn finish(app: &AppHandle, id: &str, session: &Session) {
     let state = app.state::<AppState>();
     // The game was gone for every missed poll.
-    let seconds = session
-        .since
-        .elapsed()
-        .as_secs()
-        .saturating_sub(POLL.as_secs() * session.misses as u64);
+    let seconds = session.since.elapsed().as_secs().saturating_sub(POLL.as_secs() * session.misses as u64);
     let an_app = is_app(app, id);
     // A game that didn't stay, like one refused its license at launch, hasn't been played.
     // Time in an app isn't playtime, but when it was last used orders the Apps tab.
@@ -745,30 +550,16 @@ fn finish(app: &AppHandle, id: &str, session: &Session) {
         state.save_user(&user);
     }
     state.running.lock().unwrap().retain(|r| r.id != id);
-    process_ids().lock().unwrap().remove(id);
+    PIDS.lock().unwrap().remove(id);
     let what = if an_app { "app closed" } else { "session end" };
     crate::log::info(&format!("{what} {id} after {seconds}s"));
-    let _ = app.emit(
-        "game-stopped",
-        Stopped {
-            id: id.to_string(),
-            seconds,
-        },
-    );
+    let _ = app.emit("game-stopped", Stopped { id: id.to_string(), seconds });
     // Come back to the front only for games we sent the player into, and not over another
     // game the player has moved on to.
     if session.from_mantel {
         // Gaming Services may have something left to say, like that license refusal; Mantel
         // waits its turn instead of covering it.
-        let name = state
-            .cache
-            .lock()
-            .unwrap()
-            .library
-            .iter()
-            .find(|g| g.id == id)
-            .map(|g| g.name.clone())
-            .unwrap_or_default();
+        let name = state.cache.lock().unwrap().library.iter().find(|g| g.id == id).map(|g| g.name.clone()).unwrap_or_default();
         let app = app.clone();
         std::thread::spawn(move || {
             let (mut sys, start) = (System::new(), Instant::now());
@@ -784,14 +575,7 @@ fn finish(app: &AppHandle, id: &str, session: &Session) {
 
 /// Whether the window in front belongs to a game that's still running.
 fn in_another_game(app: &AppHandle) -> bool {
-    let ids: Vec<String> = app
-        .state::<AppState>()
-        .running
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|r| r.id.clone())
-        .collect();
+    let ids: Vec<String> = app.state::<AppState>().running.lock().unwrap().iter().map(|r| r.id.clone()).collect();
     if ids.is_empty() {
         return false;
     }
@@ -803,19 +587,14 @@ fn in_another_game(app: &AppHandle) -> bool {
 /// The library game whose window is in front, if any.
 #[cfg(windows)]
 fn front_game(sys: &System, targets: &[Target]) -> Option<String> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
-    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut pid) };
     if pid == 0 || pid == std::process::id() {
         return None;
     }
     let process = sys.process(sysinfo::Pid::from_u32(pid))?;
-    targets
-        .iter()
-        .find(|t| matches(t, process))
-        .map(|t| t.id.clone())
+    targets.iter().find(|t| matches(t, process)).map(|t| t.id.clone())
 }
 
 #[cfg(not(windows))]
@@ -835,25 +614,14 @@ pub fn to_front(app: &AppHandle) {
 fn expire_pending(app: &AppHandle, sessions: &HashMap<String, Session>) {
     let mut pending = PENDING.lock().unwrap();
     let Some(p) = pending.as_ref() else { return };
-    let limit = if p.trackable {
-        DETECT_WINDOW
-    } else {
-        Duration::from_secs(8)
-    };
+    let limit = if p.trackable { DETECT_WINDOW } else { Duration::from_secs(8) };
     if sessions.contains_key(&p.id) || p.at.elapsed() < limit {
         return;
     }
     let id = p.id.clone();
     *pending = None;
-    app.state::<AppState>()
-        .running
-        .lock()
-        .unwrap()
-        .retain(|r| r.id != id || r.detected);
-    crate::log::warn(&format!(
-        "launch {id}: no process seen within {}s",
-        limit.as_secs()
-    ));
+    app.state::<AppState>().running.lock().unwrap().retain(|r| r.id != id || r.detected);
+    crate::log::warn(&format!("launch {id}: no process seen within {}s", limit.as_secs()));
     let _ = app.emit("game-launch-timeout", &id);
 }
 
@@ -879,12 +647,7 @@ fn targets(app: &AppHandle) -> Vec<Target> {
 fn app_targets(app: &AppHandle) -> Vec<Target> {
     let state = app.state::<AppState>();
     let cache = state.cache.lock().unwrap();
-    cache
-        .library
-        .iter()
-        .filter(|g| g.is_app())
-        .filter_map(|g| app_target(g))
-        .collect()
+    cache.library.iter().filter(|g| g.is_app()).filter_map(|g| app_target(g)).collect()
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -894,12 +657,7 @@ fn app_target(g: &Game) -> Option<Target> {
         exes.extend(path.rsplit(['\\', '/']).next().map(str::to_lowercase));
     }
     let dir = g.install_dir.as_deref().map(normalize_dir);
-    (dir.is_some() || !exes.is_empty()).then(|| Target {
-        id: g.id.clone(),
-        dir,
-        exes,
-        window: true,
-    })
+    (dir.is_some() || !exes.is_empty()).then(|| Target { id: g.id.clone(), dir, exes, window: true })
 }
 
 /// Whether an app's window is in front. The pad then belongs to that app, even while Mantel
@@ -920,18 +678,8 @@ pub fn watch_front(app: &AppHandle) {
     #[cfg(windows)]
     std::thread::spawn(|| unsafe {
         use windows_sys::Win32::UI::Accessibility::SetWinEventHook;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            GetMessageW, EVENT_SYSTEM_FOREGROUND, MSG, WINEVENT_OUTOFCONTEXT,
-        };
-        let hook = SetWinEventHook(
-            EVENT_SYSTEM_FOREGROUND,
-            EVENT_SYSTEM_FOREGROUND,
-            std::ptr::null_mut(),
-            Some(front_changed),
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT,
-        );
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetMessageW, EVENT_SYSTEM_FOREGROUND, MSG, WINEVENT_OUTOFCONTEXT};
+        let hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, std::ptr::null_mut(), Some(front_changed), 0, 0, WINEVENT_OUTOFCONTEXT);
         if hook.is_null() {
             return crate::log::warn("front window: not followed, only checked every few seconds");
         }
@@ -942,15 +690,7 @@ pub fn watch_front(app: &AppHandle) {
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn front_changed(
-    _hook: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK,
-    _event: u32,
-    _hwnd: windows_sys::Win32::Foundation::HWND,
-    _object: i32,
-    _child: i32,
-    _thread: u32,
-    _time: u32,
-) {
+unsafe extern "system" fn front_changed(_hook: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK, _event: u32, _hwnd: windows_sys::Win32::Foundation::HWND, _object: i32, _child: i32, _thread: u32, _time: u32) {
     if let Some(app) = WATCHING.get() {
         check_front(app);
     }
@@ -966,20 +706,13 @@ fn check_front(app: &AppHandle) {
 
 #[cfg(windows)]
 fn front_is_app(app: &AppHandle) -> bool {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
-    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
     let hwnd = unsafe { GetForegroundWindow() };
     let mut pid = 0u32;
-    if hwnd.is_null()
-        || unsafe { GetWindowThreadProcessId(hwnd, &mut pid) } == 0
-        || pid == std::process::id()
-    {
+    if hwnd.is_null() || unsafe { GetWindowThreadProcessId(hwnd, &mut pid) } == 0 || pid == std::process::id() {
         return false;
     }
-    let Some(mut exe) = exe_of(pid) else {
-        return false;
-    };
+    let Some(mut exe) = exe_of(pid) else { return false };
     // A Store app's window belongs to the frame host; the app's own process draws inside it.
     if file_name(&exe).eq_ignore_ascii_case("applicationframehost.exe") {
         match hosted_by(hwnd, pid).and_then(exe_of) {
@@ -988,9 +721,7 @@ fn front_is_app(app: &AppHandle) -> bool {
         }
     }
     let name = file_name(&exe);
-    app_targets(app)
-        .iter()
-        .any(|t| matches_exe(t, Some(&exe), name))
+    app_targets(app).iter().any(|t| matches_exe(t, Some(&exe), name))
 }
 
 #[cfg(not(windows))]
@@ -1008,10 +739,7 @@ fn file_name(path: &str) -> &str {
 #[cfg(windows)]
 fn exe_of(pid: u32) -> Option<String> {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if process.is_null() {
@@ -1019,9 +747,7 @@ fn exe_of(pid: u32) -> Option<String> {
         }
         let mut buf = [0u16; 1024];
         let mut len = buf.len() as u32;
-        let ok =
-            QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
-                != 0;
+        let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0;
         CloseHandle(process);
         ok.then(|| String::from_utf16_lossy(&buf[..len as usize]))
     }
@@ -1055,11 +781,7 @@ fn hosted_by(frame: windows_sys::Win32::Foundation::HWND, host: u32) -> Option<u
 
 fn refresh(sys: &mut System) {
     // Exe paths are cached per pid, so after the first pass only new processes cost anything.
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
-    );
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet));
 }
 
 fn matches(t: &Target, p: &sysinfo::Process) -> bool {
@@ -1099,37 +821,21 @@ pub fn open_folder(path: &str) -> Result<(), String> {
     let cmd = "explorer.exe";
     #[cfg(not(windows))]
     let cmd = "open";
-    std::process::Command::new(cmd)
-        .arg(PathBuf::from(path))
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    std::process::Command::new(cmd).arg(PathBuf::from(path)).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// ShellExecute on its own COM-initialised thread: shell: URIs and protocol handlers need COM.
 #[cfg(windows)]
 fn open_uri(uri: &str) -> Result<(), String> {
-    use windows_sys::Win32::System::Com::{
-        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
-    };
+    use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
     let (verb, file) = (wide("open"), wide(uri));
     let code = std::thread::spawn(move || unsafe {
-        CoInitializeEx(
-            std::ptr::null(),
-            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-        );
-        let r = ShellExecuteW(
-            std::ptr::null_mut(),
-            verb.as_ptr(),
-            file.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        );
+        CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32);
+        let r = ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
         CoUninitialize();
         r as isize
     })
@@ -1143,17 +849,43 @@ fn open_uri(uri: &str) -> Result<(), String> {
     }
 }
 
+/// What a shortcut to a program runs: the program, with its arguments as written and its working
+/// folder. None for any other file, for a program that isn't there any more (the shell may find
+/// where it went) and for a shortcut set to run as administrator: the shell handles those.
+#[cfg(windows)]
+fn shortcut_command(uri: &str) -> Option<std::process::Command> {
+    use std::os::windows::process::CommandExt;
+    if !uri.to_lowercase().ends_with(".lnk") {
+        return None;
+    }
+    let link = crate::pick::shortcut(uri)?;
+    let exe = Path::new(&link.target);
+    if link.elevated || !exe.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) || !exe.is_file() {
+        return None;
+    }
+    let mut cmd = std::process::Command::new(exe);
+    if !link.arguments.trim().is_empty() {
+        cmd.raw_arg(&link.arguments);
+    }
+    let dir = Some(PathBuf::from(&link.working_dir)).filter(|d| d.is_dir()).or_else(|| exe.parent().map(Path::to_path_buf));
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
+    Some(cmd)
+}
+
+#[cfg(not(windows))]
+fn shortcut_command(_uri: &str) -> Option<std::process::Command> {
+    None
+}
+
 #[cfg(not(windows))]
 fn open_uri(uri: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let cmd = "open";
     #[cfg(not(target_os = "macos"))]
     let cmd = "xdg-open";
-    std::process::Command::new(cmd)
-        .arg(uri)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    std::process::Command::new(cmd).arg(uri).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1161,53 +893,51 @@ mod tests {
     use super::*;
 
     fn ids(running: &[Running]) -> Vec<(&str, bool)> {
-        running
-            .iter()
-            .map(|r| (r.id.as_str(), r.detected))
-            .collect()
+        running.iter().map(|r| (r.id.as_str(), r.detected)).collect()
     }
 
-    fn target(id: &str, window: bool) -> Target {
-        Target {
-            id: id.into(),
-            dir: None,
-            exes: vec!["eden.exe".into()],
-            window,
-        }
+    fn eden(id: &str, window: bool) -> Target {
+        Target { id: id.into(), dir: None, exes: vec!["eden.exe".into()], window }
     }
 
     #[test]
-    fn launching_a_game_marks_its_matching_app_but_not_other_shortcuts() {
-        let targets = vec![
-            target("app:eden", true),
-            target("custom:k", false),
-            target("custom:m", false),
-        ];
+    fn a_launch_claims_its_process_from_other_shortcuts_to_the_same_emulator() {
+        let targets = [eden("app:eden", true), eden("custom:kirby", false), eden("custom:mario", false)];
         let matched: Vec<&Target> = targets.iter().collect();
-        assert_eq!(
-            process_owners(&targets, &matched, Some("custom:k"), true),
-            vec!["custom:k".to_string(), "app:eden".to_string()]
-        );
+        // Eden on the Apps tab runs along with the game.
+        assert_eq!(owners_of(&matched, Some("custom:mario")), ["custom:mario", "app:eden"]);
+        // Eden opened by itself isn't any of its games.
+        assert_eq!(owners_of(&matched, Some("app:eden")), ["app:eden"]);
+        // Nobody launched it: the first match, as before.
+        assert_eq!(owners_of(&matched, None), ["app:eden"]);
+        assert_eq!(owners_of(&matched[1..], None), ["custom:kirby"]);
     }
 
     #[test]
-    fn launching_an_app_does_not_mark_its_game_shortcuts() {
-        let targets = vec![target("app:eden", true), target("custom:k", false)];
-        let matched: Vec<&Target> = targets.iter().collect();
-        assert_eq!(
-            process_owners(&targets, &matched, Some("app:eden"), true),
-            vec!["app:eden".to_string()]
-        );
+    fn a_launch_claims_its_process_even_when_nothing_else_knows_it() {
+        // A game added by hand whose program couldn't be told: only the launch knows its process.
+        assert_eq!(owners_of(&[], Some("custom:x")), ["custom:x"]);
+        assert!(owners_of(&[], None).is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
-    fn an_unattributed_process_keeps_the_existing_first_match() {
-        let targets = vec![target("app:eden", true), target("custom:k", false)];
-        let matched: Vec<&Target> = targets.iter().collect();
-        assert_eq!(
-            process_owners(&targets, &matched, None, false),
-            vec!["app:eden".to_string()]
-        );
+    fn a_shortcut_runs_its_program_in_its_folder() {
+        let dir = std::env::temp_dir().join(format!("mantel-launch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let lnk = dir.join("Kirby’s Return to Dream Land Deluxe.lnk");
+        crate::pick::tests::save(&lnk, exe.to_str().unwrap(), r#"-f -g "C:/ROMS\Kirby’s.xci""#, dir.to_str().unwrap());
+        let cmd = shortcut_command(lnk.to_str().unwrap());
+        let gone = dir.join("gone.lnk");
+        crate::pick::tests::save(&gone, &dir.join("gone.exe").to_string_lossy(), "", "");
+        let to_missing = shortcut_command(gone.to_str().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+        let cmd = cmd.unwrap();
+        assert_eq!((cmd.get_program(), cmd.get_current_dir()), (exe.as_os_str(), Some(dir.as_path())));
+        // A program that isn't there any more is left to the shell.
+        assert!(to_missing.is_none());
+        assert!(shortcut_command("steam://rungameid/1").is_none());
     }
 
     #[test]
@@ -1219,10 +949,7 @@ mod tests {
         detected(&mut running, "b", 210);
         assert_eq!(ids(&running), [("a", true), ("b", true)]);
         // A launch from Mantel counts from when it was started, not when its process showed up.
-        assert_eq!(
-            running.iter().map(|r| r.started_at).collect::<Vec<_>>(),
-            [100, 200]
-        );
+        assert_eq!(running.iter().map(|r| r.started_at).collect::<Vec<_>>(), [100, 200]);
     }
 
     #[test]
@@ -1253,40 +980,24 @@ mod tests {
 
     #[test]
     fn an_apps_window_is_known_by_its_program() {
-        let mut spotify = app(Launch::Uri {
-            uri: "shell:AppsFolder\\Spotify".into(),
-        });
+        let mut spotify = app(Launch::Uri { uri: "shell:AppsFolder\\Spotify".into() });
         spotify.install_dir = Some(r"C:\Users\p\AppData\Roaming\Spotify".into());
         spotify.exe_names = vec!["Spotify.exe".into()];
         let t = app_target(&spotify).unwrap();
-        assert!(matches_exe(
-            &t,
-            Some(r"C:\Users\p\AppData\Roaming\Spotify\Spotify.exe"),
-            "Spotify.exe"
-        ));
+        assert!(matches_exe(&t, Some(r"C:\Users\p\AppData\Roaming\Spotify\Spotify.exe"), "Spotify.exe"));
         assert!(matches_exe(&t, None, "spotify.exe"));
-        assert!(!matches_exe(
-            &t,
-            Some(r"C:\Users\p\AppData\Roaming\SpotifyHelper\helper.exe"),
-            "helper.exe"
-        ));
+        assert!(!matches_exe(&t, Some(r"C:\Users\p\AppData\Roaming\SpotifyHelper\helper.exe"), "helper.exe"));
     }
 
     #[test]
     fn a_site_is_known_by_the_browser_it_opens_in() {
         let edge = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
-        let mut youtube = app(Launch::Exe {
-            path: edge.into(),
-            args: vec!["--app=https://www.youtube.com".into()],
-            cwd: None,
-        });
+        let mut youtube = app(Launch::Exe { path: edge.into(), args: vec!["--app=https://www.youtube.com".into()], cwd: None });
         youtube.site = Some("youtube.com".into());
         let t = app_target(&youtube).unwrap();
         assert!(matches_exe(&t, Some(edge), "msedge.exe"));
         // Without a browser of its own, a site leaves nothing to know it by.
-        let mut by_uri = app(Launch::Uri {
-            uri: "https://www.youtube.com".into(),
-        });
+        let mut by_uri = app(Launch::Uri { uri: "https://www.youtube.com".into() });
         by_uri.site = Some("youtube.com".into());
         assert!(app_target(&by_uri).is_none());
     }
@@ -1294,16 +1005,9 @@ mod tests {
     #[test]
     fn terminates_a_process() {
         #[cfg(windows)]
-        let mut child = std::process::Command::new("ping")
-            .args(["-n", "30", "127.0.0.1"])
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut child = std::process::Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
         #[cfg(not(windows))]
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         let mut sys = System::new();
         refresh(&mut sys);
         assert_eq!(terminate(&sys, child.id()), Ok(()));
